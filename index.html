@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Pixel Runner</title>
+  <style>
+    :root{
+      --ui:#eaeaf2; --muted:#aab; --good:#7ee787; --bad:#ff7373; --gold:#ffd766; --ink:#0b1021;
+    }
+    html,body{height:100%}
+    body{margin:0; background:#0b1021; color:#d7e0ff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display:grid; place-items:center}
+    .frame{ position:relative; width:min(100vw, 1100px); aspect-ratio:16/9; display:grid; place-items:center;}
+    canvas{ image-rendering: pixelated; image-rendering: crisp-edges; width:100%; height:100%; background:#111 }
+    .hud{ position:absolute; inset:0; pointer-events:none; display:flex; flex-direction:column; justify-content:space-between; }
+    .topbar{ display:flex; gap:10px; align-items:center; padding:10px 14px; font-size:14px; }
+    .pill{ background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.15); padding:6px 10px; border-radius:999px; backdrop-filter: blur(2px); }
+    .right{ margin-left:auto; display:flex; gap:8px; align-items:center }
+    .btn{ pointer-events:auto; cursor:pointer; padding:6px 10px; border-radius:10px; border:1px solid rgba(255,255,255,.2); background:rgba(0,0,0,.4); color:var(--ui); font-weight:700; transition:.15s }
+    .btn:hover{ transform:translateY(-1px) }
+    .center{ pointer-events:none; position:absolute; inset:0; display:grid; place-items:center; text-align:center }
+    .title{ font-size:28px; letter-spacing:.5px; text-shadow:0 3px 0 #0008 }
+    .subtitle{ color:#bcd; font-size:14px }
+    .notice{ position:absolute; bottom:10px; left:0; right:0; text-align:center; color:#bcd; font-size:12px }
+
+    /* Mobile controls */
+    .controls{ position:absolute; inset:0; display:flex; justify-content:space-between; padding:16px; gap:16px; }
+    .pad{ pointer-events:auto; width:120px; height:120px; border-radius:18px; background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(0,0,0,.25)); border:1px solid rgba(255,255,255,.15); display:grid; place-items:center; user-select:none; -webkit-user-select:none; touch-action:manipulation;}
+    .pad span{ font-weight:800; opacity:.9 }
+    @media (min-width:900px){ .pad{ opacity:.85 } }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <canvas id="game" width="512" height="288"></canvas>
+    <div class="hud">
+      <div class="topbar">
+        <div class="pill" id="scorePill">Skor: 0</div>
+        <div class="pill" id="distPill">Jarak: 0m</div>
+        <div class="pill" id="biomePill">Biome: —</div>
+        <div class="pill" id="lifePill">❤︎ 1</div>
+        <div class="pill" id="coinPill">Koin: 0</div>
+        <div class="right">
+          <button class="btn" id="btnPause">⏸️</button>
+          <button class="btn" id="btnMute">🔊</button>
+          <button class="btn" id="btnHelp">❔</button>
+        </div>
+      </div>
+      <div class="controls" id="touchCtrl" style="pointer-events:none">
+        <div class="pad" id="btnJump"><span>JUMP</span></div>
+        <div class="pad" id="btnSlide"><span>SLIDE</span></div>
+      </div>
+      <div class="center" id="overlay"></div>
+      <div class="notice">⤷ Keyboard: [W/↑] Lompat • [S/↓] Slide • [P] Jeda • [R] Ulang • [M] Mute • [L] Serang Boss (Blaster)</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ===== Helpers =====
+  const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
+  const lerp = (a,b,t)=>a+(b-a)*t;
+  const rand = (a=1,b=0)=>Math.random()*(b-a)+a;
+  const choice = arr => arr[(Math.random()*arr.length)|0];
+
+  // ===== Persist =====
+  const store = {
+    get k(){ return Number(localStorage.getItem('pxr_bank')||0) },
+    set k(v){ localStorage.setItem('pxr_bank', String(Math.max(0,Math.floor(v)))) },
+    get hi(){ return Number(localStorage.getItem('pxr_hi')||0) },
+    set hi(v){ localStorage.setItem('pxr_hi', String(v)) },
+    get upg(){ try{ return JSON.parse(localStorage.getItem('pxr_upg')||'{}') }catch{return {}} },
+    set upg(v){ localStorage.setItem('pxr_upg', JSON.stringify(v)) },
+    get levels(){ try{ return JSON.parse(localStorage.getItem('pxr_lv')||'{}') }catch{return {}} },
+    set levels(v){ localStorage.setItem('pxr_lv', JSON.stringify(v)) },
+    reset(){ localStorage.removeItem('pxr_bank'); localStorage.removeItem('pxr_hi'); localStorage.removeItem('pxr_upg'); localStorage.removeItem('pxr_lv'); }
+  };
+
+  // ===== Audio (tiny bleeps) =====
+  let audioOn = true; let acx = null;
+  function beep(type='square', freq=880, dur=0.06, vol=0.05){
+    if(!audioOn) return;
+    try{
+      acx ??= new (window.AudioContext||window.webkitAudioContext)();
+      const o=acx.createOscillator(); const g=acx.createGain();
+      o.type = type; o.frequency.value=freq; g.gain.value=vol;
+      o.connect(g).connect(acx.destination);
+      o.start(); o.stop(acx.currentTime+dur);
+    }catch{ /* ignore */ }
+  }
+
+  // ===== Canvas =====
+  const cvs = document.getElementById('game');
+  const ctx = cvs.getContext('2d'); ctx.imageSmoothingEnabled=false;
+  const BASE_W=512, BASE_H=288;
+  function fitCanvas(){ const dpr=Math.min(devicePixelRatio||1,3); cvs.width=BASE_W*dpr; cvs.height=BASE_H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); }
+  addEventListener('resize', fitCanvas); fitCanvas();
+
+  // ===== Biomes =====
+  const biomes = [
+    { name:'Hutan', sky:'#20324a', sky2:'#0e1928', ground:'#2c5d3f', deco:'#9ad97b', accents:'#7ee787' },
+    { name:'Gurun', sky:'#40361f', sky2:'#1f170c', ground:'#8b6b2a', deco:'#f3cd7b', accents:'#ffd766' },
+    { name:'Salju', sky:'#6b8fb4', sky2:'#2a3f5a', ground:'#b8d4e7', deco:'#eaf6ff', accents:'#ffffff' },
+    { name:'Volkanik', sky:'#2f0f0f', sky2:'#120606', ground:'#3b1b1b', deco:'#ff7a52', accents:'#ffbd9b' },
+  ];
+  function biome(){ return biomes[state.biomeIdx % biomes.length]; }
+
+  // ===== Upgrades & Levels =====
+  const defaultUpg = { hearts:1, startShield:0, magnet:0, scoreBoost:0, blaster:0 };
+  let upg = Object.assign({}, defaultUpg, store.upg);
+  const levelDefs = [
+    { id:1, name:'Level 1 — Hutan', target:420, biomeStart:0 },
+    { id:2, name:'Level 2 — Gurun', target:650, biomeStart:1 },
+    { id:3, name:'Level 3 — Salju', target:900, biomeStart:2 },
+    { id:4, name:'Level 4 — Volkanik', target:1200, biomeStart:3 },
+    { id:5, name:'Level 5 — Campur', target:1500, biomeStart:0 },
+  ];
+  let lv = Object.assign({ unlocked:[1], stars:{} }, store.levels);
+  if(!lv.unlocked.includes(1)) lv.unlocked=[1];
+
+  // ===== Game State =====
+  const state = {
+    mode: 'menu', // menu | play | pause | dead | shop | levels | boss | win
+    time: 0, score: 0, distance: 0, hi: store.hi,
+    runCoins: 0, // coins earned this run
+    bank: store.k,
+    speed: 2.2,
+    biomeIdx: 0,
+    biomeSwitchEvery: 450,
+    groundY: BASE_H - 48,
+    obstacles: [], coins: [], particles: [], clouds: [], enemies: [], powerups: [], projectiles: [],
+    boss: null,
+    levelMode: null, // {id, target}
+    scoreMul: 1,
+    shield: 0,
+    hearts: 1,
+  };
+
+  // ===== Player =====
+  const player = { x: 92, y: 0, w: 18, h: 22, vx:0, vy:0, onGround:false, coyote:0, jumpBuf:0, doubleReady:true, sliding:false, slideT:0, alive:true, hurtI:0 };
+
+  // ===== Input =====
+  const keys = new Set();
+  addEventListener('keydown', e=>{
+    const k = e.key.toLowerCase();
+    if([' ','arrowup','w','arrowdown','s','p','r','m','l'].includes(k)) e.preventDefault();
+    keys.add(k);
+    if(k==='p') togglePause();
+    if(k==='m'){ audioOn=!audioOn; document.getElementById('btnMute').textContent = audioOn? '🔊':'🔇'; }
+    if(k==='r' && (state.mode==='dead'||state.mode==='pause'||state.mode==='win')) startEndless();
+    if(k==='l') tryBlaster();
+  });
+  addEventListener('keyup', e=> keys.delete(e.key.toLowerCase()));
+
+  // Touch controls
+  const touchCtrl = document.getElementById('touchCtrl');
+  const btnJump = document.getElementById('btnJump');
+  const btnSlide = document.getElementById('btnSlide');
+  function touchable(){ return matchMedia('(pointer: coarse)').matches; }
+  function bindPad(el, onDown, onUp){
+    const d = e=>{ e.preventDefault(); onDown(); };
+    const u = e=>{ e.preventDefault(); onUp&&onUp(); };
+    el.addEventListener('touchstart', d, {passive:false});
+    el.addEventListener('touchend', u, {passive:false});
+    el.addEventListener('mousedown', d); el.addEventListener('mouseup', u);
+  }
+  bindPad(btnJump, ()=> keys.add(' '), ()=> keys.delete(' '));
+  bindPad(btnSlide, ()=> keys.add('arrowdown'), ()=> keys.delete('arrowdown'));
+  function setTouchVisibility(){ touchCtrl.style.pointerEvents = touchable()? 'auto':'none'; }
+  setTouchVisibility(); addEventListener('resize', setTouchVisibility);
+
+  // ===== UI =====
+  const overlay = document.getElementById('overlay');
+  document.getElementById('btnPause').onclick = ()=> togglePause();
+  document.getElementById('btnMute').onclick = ()=>{ audioOn=!audioOn; document.getElementById('btnMute').textContent = audioOn? '🔊':'🔇'; };
+  document.getElementById('btnHelp').onclick = ()=> showHelp(state.mode==='pause'?'pause':'menu');
+
+  function showMenu(){
+    state.mode='menu';
+    overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px;">
+        <div class="title">PIXEL RUNNER — Edisi Lengkap</div>
+        <div class="subtitle" style="margin-top:6px">Endless + Mode Level, Boss tiap biome, Power-Up, Toko, Simpan progres.</div>
+        <div class="subtitle" style="margin-top:8px">Bank koin: <b>${state.bank}</b> • High score: <b>${state.hi}</b></div>
+        <div style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap">
+          <button class="btn" id="btnStart">▶ Main Endless</button>
+          <button class="btn" id="btnLevels">📜 Mode Level</button>
+          <button class="btn" id="btnShop">🛒 Toko</button>
+          <button class="btn" id="btnHow">❔ Cara Main</button>
+          <button class="btn" id="btnReset">♻️ Reset Data</button>
+        </div>
+      </div>`;
+    document.getElementById('btnStart').onclick=startEndless;
+    document.getElementById('btnLevels').onclick=showLevels;
+    document.getElementById('btnShop').onclick=showShop;
+    document.getElementById('btnHow').onclick=()=>showHelp('menu');
+    document.getElementById('btnReset').onclick=()=>{ if(confirm('Yakin reset semua data?')){ store.reset(); upg=Object.assign({},defaultUpg); lv={unlocked:[1],stars:{}}; state.bank=0; state.hi=0; showMenu(); } };
+  }
+  function showHelp(back='pause'){
+    overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px; max-width:560px">
+        <div class="title">Cara Main</div>
+        <div class="subtitle" style="margin-top:10px; text-align:left">
+          • [W/↑/JUMP] <b>lompat</b> (bisa double jump).<br/>
+          • [S/↓/SLIDE] <b>slide</b> melewati palang rendah.<br/>
+          • Hindari spike, pit, roller, block, dan musuh terbang.<br/>
+          • Kumpulkan koin. Magnet menarik koin di sekitar. Shield menahan 1 hit. <br/>
+          • Boss muncul saat pergantian biome / akhir level: <b>bertahan</b> sampai bar Boss habis. <br/>
+          • Punya Blaster? serang Boss dengan [L].
+        </div>
+        <div style="margin-top:12px; text-align:center">
+          <button class="btn" id="btnBack">Kembali</button>
+        </div>
+      </div>`;
+    document.getElementById('btnBack').onclick = ()=>{ if(back==='pause') pauseGame(); else showMenu(); };
+  }
+
+  function showShop(){
+    state.mode='shop';
+    const items = [
+      { key:'hearts', name:'Extra Heart (max 3)', max:3, base:60, desc:'Tambahan nyawa awal.' },
+      { key:'startShield', name:'Start Shield', max:1, base:50, desc:'Awal run langsung ada shield.' },
+      { key:'magnet', name:'Magnet Lv', max:3, base:40, desc:'Tarikan koin makin kuat.' },
+      { key:'scoreBoost', name:'Score Boost Lv', max:3, base:40, desc:'Skor +20% per level.' },
+      { key:'blaster', name:'Blaster', max:1, base:70, desc:'Bisa menembak Boss [L].' },
+    ];
+
+    function costFor(it){ const lvl=upg[it.key]||0; return Math.floor(it.base * Math.pow(1.6, lvl)); }
+
+    function render(){
+      overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px; max-width:720px">
+        <div class="title">🛒 Toko</div>
+        <div class="subtitle" style="margin-top:6px">Bank: <b>${state.bank}</b> koin</div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:10px; margin-top:10px">
+          ${items.map(it=>{
+            const lvl = upg[it.key]||0; const maxed = lvl>=it.max; const c = costFor(it);
+            return `<div style='background:rgba(0,0,0,.35); border:1px solid #ffffff22; border-radius:12px; padding:10px; text-align:left'>
+              <div style='font-weight:800'>${it.name}</div>
+              <div class='subtitle' style='margin:6px 0'>${it.desc}<br/>Lvl: <b>${lvl}</b>${maxed? ' (MAX)':''}</div>
+              <button class='btn' ${maxed?'disabled':''} data-k='${it.key}'>Beli — ${c}🪙</button>
+            </div>`
+          }).join('')}
+        </div>
+        <div style="margin-top:12px; text-align:center"><button class="btn" id="btnBackMenu">⬅︎ Kembali</button></div>
+      </div>`;
+      overlay.querySelectorAll('button[data-k]').forEach(btn=>{
+        btn.onclick=()=>{
+          const key = btn.getAttribute('data-k');
+          const it = items.find(i=>i.key===key);
+          const lvl=upg[key]||0; if(lvl>=it.max) return;
+          const price = costFor(it);
+          if(state.bank>=price){ state.bank -= price; upg[key]=lvl+1; store.upg=upg; store.k=state.bank; render(); beep('square', 960, .06); }
+          else { beep('square', 220, .06); }
+        };
+      });
+      document.getElementById('btnBackMenu').onclick=showMenu;
+    }
+    render();
+  }
+
+  function showLevels(){
+    state.mode='levels';
+    overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px; max-width:760px">
+        <div class="title">📜 Mode Level</div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:10px; margin-top:10px">
+          ${levelDefs.map(ld=>{
+            const unlocked = lv.unlocked.includes(ld.id);
+            const star = lv.stars[ld.id]? '★': '☆';
+            return `<div style='background:rgba(0,0,0,.35); border:1px solid #ffffff22; border-radius:12px; padding:10px; text-align:left; opacity:${unlocked?1:.5}'>
+              <div style='font-weight:800'>${ld.name}</div>
+              <div class='subtitle'>Target: ${ld.target}m</div>
+              <div class='subtitle'>Status: ${unlocked? 'Terbuka':'Terkunci'}</div>
+              <div style='margin-top:6px; display:flex; gap:6px; align-items:center'>
+                <button class='btn' data-lv='${ld.id}' ${unlocked?'':'disabled'}>▶ Main</button>
+                <div>${star}</div>
+              </div>
+            </div>`
+          }).join('')}
+        </div>
+        <div style="margin-top:12px; text-align:center"><button class="btn" id="btnBackMenu">⬅︎ Kembali</button></div>
+      </div>`;
+    overlay.querySelectorAll('button[data-lv]').forEach(btn=>{
+      btn.onclick=()=> startLevel(Number(btn.getAttribute('data-lv')));
+    });
+    document.getElementById('btnBackMenu').onclick=showMenu;
+  }
+
+  function showDead(){
+    overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px;">
+        <div class="title">Game Over</div>
+        <div class="subtitle" style="margin-top:6px">Skor: <b>${state.score}</b> • Jarak: <b>${Math.floor(state.distance)}m</b></div>
+        <div class="subtitle" style="margin-top:6px">Koin didapat: <b>${state.runCoins}</b> • Bank: <b>${state.bank}</b></div>
+        <div class="subtitle" style="margin-top:6px">High score: <b>${state.hi}</b></div>
+        <div style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap">
+          <button class="btn" id="btnRetry">Main Lagi</button>
+          <button class="btn" id="btnMenu">Menu</button>
+          <button class="btn" id="btnShop">🛒 Toko</button>
+        </div>
+      </div>`;
+    document.getElementById('btnRetry').onclick = startEndless;
+    document.getElementById('btnMenu').onclick = showMenu;
+    document.getElementById('btnShop').onclick = showShop;
+  }
+
+  function showWin(levelId){
+    overlay.innerHTML = `
+      <div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px;">
+        <div class="title">Level Selesai!</div>
+        <div class="subtitle" style="margin-top:6px">${levelDefs.find(l=>l.id===levelId).name}</div>
+        <div class="subtitle" style="margin-top:6px">Skor: <b>${state.score}</b> • Jarak: <b>${Math.floor(state.distance)}m</b></div>
+        <div class="subtitle" style="margin-top:6px">Koin didapat: <b>${state.runCoins}</b> • Bank: <b>${state.bank}</b></div>
+        <div style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap">
+          <button class="btn" id="btnLevels">Pilih Level</button>
+          <button class="btn" id="btnMenu">Menu</button>
+          <button class="btn" id="btnShop">🛒 Toko</button>
+        </div>
+      </div>`;
+    document.getElementById('btnLevels').onclick = showLevels;
+    document.getElementById('btnMenu').onclick = showMenu;
+    document.getElementById('btnShop').onclick = showShop;
+  }
+
+  function splash(text){ let t=90; const s = {tick(){ t--; drawCentered(text, BASE_H/2-60, 2, `rgba(255,255,255,${clamp(t/90,0,1)})`); return t>0; }}; state.particles.push(s); }
+
+  // ===== Run Control =====
+  function resetCommon(){
+    state.time=0; state.score=0; state.distance=0; state.speed=2.2;
+    state.obstacles=[]; state.coins=[]; state.particles=[]; state.clouds=[]; state.enemies=[]; state.projectiles=[]; state.powerups=[]; state.boss=null;
+    state.runCoins=0; state.scoreMul = 1 + 0.2*(upg.scoreBoost||0);
+    state.shield = upg.startShield?1:0; state.hearts = clamp(upg.hearts||1,1,3);
+    state.biomeIdx = state.levelMode? levelDefs.find(l=>l.id===state.levelMode.id).biomeStart : 0;
+    player.y = state.groundY - player.h; player.vx=0; player.vy=0; player.onGround=true; player.coyote=0; player.doubleReady=true; player.sliding=false; player.alive=true; player.hurtI=0;
+    for(let i=0;i<5;i++) spawnCloud(true);
+  }
+
+  function startEndless(){ state.levelMode=null; overlay.innerHTML=''; state.mode='play'; resetCommon(); }
+  function startLevel(id){ state.levelMode={id, target: levelDefs.find(l=>l.id===id).target}; overlay.innerHTML=''; state.mode='play'; resetCommon(); }
+
+  function togglePause(){ if(state.mode==='play'){ pauseGame(); } else if(state.mode==='pause'){ resumeGame(); } }
+  function pauseGame(){ state.mode='pause'; overlay.innerHTML=`<div style="pointer-events:auto; background:rgba(0,0,0,.45); border:1px solid #ffffff33; padding:16px 18px; border-radius:14px;"><div class="title">Jeda</div><div style="margin-top:12px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap"><button class="btn" id="btnResume">Lanjut ▶</button><button class="btn" id="btnHow2">Cara Main</button><button class="btn" id="btnMenu">Menu</button></div></div>`; document.getElementById('btnResume').onclick = resumeGame; document.getElementById('btnHow2').onclick = ()=> showHelp('pause'); document.getElementById('btnMenu').onclick = showMenu; }
+  function resumeGame(){ state.mode='play'; overlay.innerHTML=''; }
+
+  // ===== Spawners =====
+  let spawnTimer = 0, coinTimer = 0, enemyTimer=180, powerTimer=600;
+  function spawnObstacle(){
+    const t = choice(['spike','block','pit','roller','lowbar']);
+    const x = BASE_W + rand(0,60);
+    if(t==='spike'){ const w=14,h=18; const y=state.groundY-h; state.obstacles.push({t:'spike', x, y, w, h, harm:true}); }
+    else if(t==='block'){ const w=22,h=22; const y=state.groundY-h; state.obstacles.push({t:'block', x, y, w,h, harm:true}); }
+    else if(t==='pit'){ const w=rand(40,80); const y=state.groundY; state.obstacles.push({t:'pit', x, y, w, h:12, harm:true}); }
+    else if(t==='roller'){ const r=10; const y=state.groundY- r*2 + 2; state.obstacles.push({t:'roller', x, y, w:r*2, h:r*2, r, a:0, harm:true}); }
+    else if(t==='lowbar'){ const w=30,h=16; const y=state.groundY - 34; state.obstacles.push({t:'lowbar', x, y, w,h, harm:true}); }
+  }
+  function spawnCoins(){ const rows = choice([[0,1,2],[1,1,1],[0,2,0],[2,2,2],[0,1,0]]); const baseX = BASE_W + 20; const gap=16; for(let i=0;i<5;i++){ const row = rows[i%rows.length]; const y = state.groundY - 40 - row*16; const x = baseX + i*gap; state.coins.push({x,y,w:10,h:10,t:0,vx:0,vy:0}); } }
+  function spawnCloud(initial=false){ const y = rand(20, 120); const x = initial ? rand(0, BASE_W) : BASE_W + rand(0, 40); state.clouds.push({x,y, s: rand(.2,.6)}); }
+  function spawnEnemy(){ // burung/drone terbang
+    const y = rand(80, state.groundY-50); const x=BASE_W+30; const a=rand(0,Math.PI*2);
+    state.enemies.push({t:'bird', x, y, w:18, h:14, a, harm:true});
+  }
+  function spawnPower(){ const kinds=['magnet','shield','double']; const k=choice(kinds); const x=BASE_W+20; const y=state.groundY-50-rand(0,40); state.powerups.push({k,x,y,w:12,h:12,t:0}); }
+
+  // ===== Boss =====
+  function startBoss(){ if(state.boss) return; const b={ hp: 100, phase:0, x: BASE_W-80, y: 40, t:0 }; state.boss=b; splash('BOSS! — Bertahan &/atau tembak!'); }
+
+  function bossAI(){ const b=state.boss; if(!b) return; b.t++; b.x = lerp(b.x, BASE_W-100, 0.05); // stay right
+    // shoot proj / slam
+    if(b.t%90===0){ // volley
+      for(let i=0;i<4;i++){ const yy = 70 + i*22; state.projectiles.push({x:BASE_W, y:yy, w:8,h:8, vx:-3.2, vy:0, harm:true}); }
+      beep('square', 520, .06);
+    }
+    if(b.t%180===120){ // arc shots
+      for(let i=0;i<3;i++){ const vy=-3.8 - i*0.6; state.projectiles.push({x:b.x-10, y:state.groundY-20, w:8,h:8, vx:-2.2, vy, g:0.18, harm:true}); }
+      beep('sawtooth', 420, .08);
+    }
+    // lose hp slowly while surviving
+    b.hp = Math.max(0, b.hp - (upg.blaster?0.12:0.07));
+    if(b.hp===0){ endBoss(true); }
+  }
+  function endBoss(defeated){ if(!state.boss) return; if(defeated){ splash('Boss Kalah!'); state.runCoins += 25; } state.boss=null; }
+
+  function tryBlaster(){ if(state.mode!=='play' || !upg.blaster) return; // spawn bullet
+    state.projectiles.push({friendly:true, x:player.x+player.w, y:player.y+player.h/2, w:6,h:2, vx:5.5, vy:0}); beep('triangle', 1200, .04);
+  }
+
+  // ===== Physics & Controls =====
+  const G = 0.5; const JUMP = 8.9; const MAX_FALL=14;
+  function handleInput(){
+    const jumpPressed = keys.has(' ')||keys.has('arrowup')||keys.has('w');
+    const slideHeld   = keys.has('arrowdown')||keys.has('s');
+
+    if(jumpPressed) player.jumpBuf = 8; else player.jumpBuf = Math.max(0, player.jumpBuf-1);
+    player.coyote = Math.max(0, player.coyote-1);
+
+    if(player.jumpBuf>0){
+      if(player.onGround || player.coyote>0){ player.vy = -JUMP; player.onGround=false; player.coyote=0; player.jumpBuf=0; player.doubleReady=true; beep('square', 960, .06); }
+      else if(player.doubleReady){ player.vy = -JUMP*0.85; player.doubleReady=false; player.jumpBuf=0; beep('sawtooth', 1200, .05); }
+    }
+    if(slideHeld && player.onGround){ player.sliding=true; player.slideT=14; }
+    player.slideT = Math.max(0, player.slideT-1); if(player.slideT===0) player.sliding=false;
+  }
+
+  function physics(){
+    // gravity
+    player.vy += G; player.vy = clamp(player.vy, -99, MAX_FALL); player.y += player.vy;
+
+    // ground collision via groundAt
+    const gh = groundAt(player.x+player.w/2); const groundY = gh.y;
+    if(player.y + player.h >= groundY){ player.y = groundY - player.h; player.vy=0; if(!player.onGround){ player.onGround=true; player.coyote=0; } }
+    else { if(player.onGround){ player.onGround=false; player.coyote = 6; } }
+
+    // world speed scales
+    state.speed = lerp(state.speed, 2.2 + Math.min(4.2, state.distance/700), 0.005);
+    const scroll = state.speed;
+
+    // move world
+    for(const o of state.obstacles){ o.x -= scroll; if(o.t==='roller'){ o.a = (o.a + 0.2) % (Math.PI*2); } }
+    for(const e of state.enemies){ e.x -= scroll*0.9; e.a += 0.12; e.y += Math.sin(e.a)*0.6; }
+    for(const c of state.coins){ c.x -= scroll*0.98; c.t += 0.2; // magnet pull
+      const magR = 40 + (upg.magnet||0)*40; if( (power.magnet>0 || upg.magnet>0) ){ const cx=c.x+5, cy=c.y+5; const px=player.x+player.w/2, py=player.y+player.h/2; const dx=px-cx, dy=py-cy; const d=Math.hypot(dx,dy); if(d<magR){ c.vx += dx/d*0.25; c.vy += dy/d*0.25; } } c.x += c.vx||0; c.y += c.vy||0; c.vx*=0.92; c.vy*=0.92; }
+    for(const p of state.particles){ if(p.vy!=null){ p.x -= scroll*0.2; p.vy+=0.1; p.y+=p.vy; } p.life--; }
+    for(const pr of state.projectiles){ pr.x += pr.vx||0; pr.y += pr.vy||0; if(pr.g){ pr.vy += pr.g; } }
+
+    // cull
+    state.obstacles = state.obstacles.filter(o=> o.x+o.w>-40);
+    state.coins = state.coins.filter(c=> c.x+c.w>-20 && c.y<BASE_H+40);
+    state.particles = state.particles.filter(p=> p.life>0);
+    state.enemies = state.enemies.filter(e=> e.x+e.w>-30);
+    state.projectiles = state.projectiles.filter(pr=> pr.x>-30 && pr.x<BASE_W+30 && pr.y>-30 && pr.y<BASE_H+30);
+
+    for(const cl of state.clouds){ cl.x -= cl.s; } if(Math.random()<0.01) spawnCloud(); state.clouds = state.clouds.filter(cl=> cl.x>-60);
+
+    // spawn cadence
+    spawnTimer -= 1; coinTimer -= 1; enemyTimer -= 1; powerTimer -= 1;
+    if(!state.boss){
+      if(spawnTimer<=0){ spawnObstacle(); spawnTimer = 45 + Math.max(8, 30 - state.distance/60); }
+      if(coinTimer<=0){ spawnCoins(); coinTimer = 120 + Math.max(30, 140 - state.distance/25); }
+      if(enemyTimer<=0){ spawnEnemy(); enemyTimer = 200 + Math.max(30, 200 - state.distance/20); }
+      if(powerTimer<=0){ spawnPower(); powerTimer = 900; }
+    }
+
+    // biome & level distance
+    const before = Math.floor(state.distance / state.biomeSwitchEvery);
+    state.distance += scroll*0.4; // meters-ish
+    const after = Math.floor(state.distance / state.biomeSwitchEvery);
+    if(after>before){ state.biomeIdx++; splash(`Biome: ${biome().name}`); for(let i=0;i<16;i++) state.particles.push({x:rand(100,400), y:rand(40,120), vy:rand(-1,-3), life:rand(20,60)}); startBoss(); }
+
+    // level target triggers boss near end
+    if(state.levelMode && state.distance>state.levelMode.target-60 && !state.boss){ startBoss(); }
+
+    // boss update
+    if(state.boss){ bossAI(); }
+
+    // powerups timers
+    if(power.magnet>0) power.magnet--; if(power.double>0) power.double--; if(power.shieldGlow>0) power.shieldGlow--;
+    state.scoreMul = (1 + 0.2*(upg.scoreBoost||0)) * (power.double>0?2:1);
+
+    // collisions
+    const pb = getPlayerBox();
+    // coins
+    for(const c of state.coins){ if(overlap(pb,c)){ c.x=-999; state.score+=Math.floor(5*state.scoreMul); state.runCoins+=1; beep('triangle', 820, .05); for(let i=0;i<3;i++) state.particles.push({x:c.x,y:c.y,vy:rand(-1,-2.5),life:20}); }}
+    // powerups pick
+    for(const pu of state.powerups){ if(overlap(pb, pu)){ applyPower(pu.k); pu.x=-999; }}
+    state.powerups = state.powerups.filter(pu=> pu.x>-50);
+
+    // enemies & obstacles
+    for(const e of state.enemies){ if(overlap(pb,e)) { hit(); } }
+    for(const o of state.obstacles){ if(o.t==='pit'){ const rim = state.groundY; if(player.y+player.h>=rim && player.x+player.w>o.x && player.x<o.x+o.w){ hit(true); }} else { if(overlap(pb,o)) hit(); } }
+
+    // boss vs player/projectiles
+    if(state.boss){ const b=state.boss; for(const pr of state.projectiles){ if(!pr.friendly && overlap(pb, pr)){ hit(); pr.x=-999; } }
+      // friendly shots
+      if(upg.blaster){ for(const pr of state.projectiles){ if(pr.friendly && rectHitBoss(pr,b)){ pr.x=9999; b.hp = Math.max(0, b.hp-6); beep('square', 900, .04); if(b.hp===0) endBoss(true); } } }
+    }
+
+    // score & HUD
+    if(state.mode==='play'){ state.score += Math.floor(1*state.scoreMul); }
+    document.getElementById('scorePill').textContent = `Skor: ${state.score}`;
+    document.getElementById('distPill').textContent = `Jarak: ${Math.floor(state.distance)}m`;
+    document.getElementById('biomePill').textContent = `Biome: ${biome().name}`;
+    document.getElementById('coinPill').textContent = `Koin: ${state.runCoins} (+Bank ${state.bank})`;
+    document.getElementById('lifePill').textContent = `❤︎ ${state.hearts}${state.shield? ' +🛡️':''}`;
+
+    // level completion — when boss defeated in level mode
+    if(state.levelMode && !state.boss && state.distance>=state.levelMode.target){
+      // unlock next, award bonus, go win screen
+      const id = state.levelMode.id; lv.stars[id]=1; const next = levelDefs.find(l=>l.id===id+1); if(next && !lv.unlocked.includes(next.id)) lv.unlocked.push(next.id); store.levels=lv; state.bank += state.runCoins + 10; state.runCoins=0; store.k=state.bank; state.mode='win'; overlay.innerHTML=''; showWin(id); return;
+    }
+  }
+
+  function rectHitBoss(pr,b){ // boss hitbox
+    const bx=b.x-16, by=b.y, bw=40, bh=80; return pr.x < bx+bw && pr.x+pr.w > bx && pr.y < by+bh && pr.y+pr.h > by; }
+
+  function getPlayerBox(){ if(player.sliding) return { x: player.x, y: player.y+8, w: player.w, h: player.h-8 }; return { x: player.x, y: player.y, w: player.w, h: player.h }; }
+  function overlap(a,b){ return a.x<b.x+b.w && a.x+a.w>b.x && a.y<b.y+b.h && a.y+a.h>b.y; }
+
+  function hit(insta=false){ if(player.hurtI>0) return; if(state.shield>0){ state.shield=0; power.shieldGlow=50; beep('square', 260, .08); return; } if(state.hearts>1){ state.hearts--; player.hurtI=40; beep('square', 220, .1); return; } die(); }
+
+  function die(){ if(state.mode!=='play') return; player.alive=false; state.mode='dead'; beep('square', 180, .12, .06); for(let i=0;i<18;i++) state.particles.push({x:player.x+player.w/2, y:player.y+player.h/2, vy:rand(-1.5,-0.2), life:rand(10,40)}); state.hi = Math.max(state.hi, state.score); store.hi=state.hi; state.bank += state.runCoins; state.runCoins=0; store.k=state.bank; setTimeout(showDead, 60); }
+
+  function groundAt(x){ const y = state.groundY; for(const o of state.obstacles){ if(o.t==='pit' && x>o.x && x<o.x+o.w) return {y: BASE_H+999}; } return {y}; }
+
+  const power = { magnet:0, double:0, shieldGlow:0 };
+  function applyPower(k){ if(k==='magnet'){ power.magnet = 600; splash('Magnet!'); beep('triangle', 1000, .05); } else if(k==='shield'){ state.shield=1; power.shieldGlow=90; splash('Shield!'); beep('square', 600, .05); } else if(k==='double'){ power.double=600; splash('Double Score!'); beep('sawtooth', 1100, .05); } }
+
+  // ===== Rendering =====
+  function draw(){
+    const b = biome();
+    // Sky gradient
+    const g = ctx.createLinearGradient(0,0,0,BASE_H); g.addColorStop(0, b.sky); g.addColorStop(1, b.sky2); ctx.fillStyle=g; ctx.fillRect(0,0,BASE_W,BASE_H);
+
+    // Parallax
+    ctx.globalAlpha = 0.6; ctx.fillStyle = shade(b.ground, -30); drawHills(0.2, 32);
+    ctx.globalAlpha = 0.9; ctx.fillStyle = shade(b.ground, -15); drawHills(0.4, 18);
+    ctx.globalAlpha = 1;
+
+    // Clouds
+    ctx.fillStyle = b.deco; for(const cl of state.clouds) drawCloud(cl.x, cl.y);
+
+    // Ground
+    ctx.fillStyle = b.ground; ctx.fillRect(0, state.groundY, BASE_W, BASE_H-state.groundY);
+    ctx.fillStyle = shade(b.ground, -20); for(let x=0;x<BASE_W;x+=16){ ctx.fillRect(x, state.groundY, 14, 4); }
+
+    // Obstacles
+    for(const o of state.obstacles){ if(o.t==='spike') drawSpike(o); else if(o.t==='block') drawBlock(o); else if(o.t==='pit') { ctx.fillStyle=shade(b.ground,-40); ctx.fillRect(o.x, state.groundY-2, o.w, 2); } else if(o.t==='roller') drawRoller(o); else if(o.t==='lowbar') drawLowbar(o); }
+
+    // Enemies
+    for(const e of state.enemies){ drawBird(e); }
+
+    // Coins & powerups
+    for(const c of state.coins){ drawCoin(c); }
+    for(const pu of state.powerups){ drawPower(pu); }
+
+    // Projectiles
+    for(const pr of state.projectiles){ drawProj(pr); }
+
+    // Player
+    drawPlayer();
+
+    // Boss UI
+    if(state.boss){ drawBoss(state.boss); }
+
+    // Particles & splashes
+    for(const p of state.particles){ if(p.tick){ if(!p.tick()) p.life=0; } else { ctx.fillStyle=b.accents; ctx.fillRect(p.x, p.y, 2,2); } }
+  }
+
+  function drawHills(speed, amp){ const step = 48; const base = state.groundY; const off = (state.time*speed)%step; for(let x=-step;x<BASE_W+step;x+=step){ const h = 20 + Math.sin((x+off)*0.05)*amp; ctx.beginPath(); ctx.moveTo(x+off, base); ctx.lineTo(x+step*0.5+off, base-h); ctx.lineTo(x+step+off, base); ctx.closePath(); ctx.fill(); } }
+  function drawCloud(x,y){ ctx.fillRect(x, y, 14,8); ctx.fillRect(x+6, y-4, 18,10); ctx.fillRect(x+12, y, 12,8); }
+  function drawSpike(o){ ctx.fillStyle="#333"; ctx.fillRect(o.x, o.y+o.h-2, o.w, 2); ctx.fillStyle="#ddd"; triangle(o.x, o.y+o.h, o.x+o.w/2, o.y, o.x+o.w, o.y+o.h); }
+  function drawBlock(o){ ctx.fillStyle="#444"; ctx.fillRect(o.x, o.y, o.w, o.h); ctx.fillStyle="#666"; ctx.fillRect(o.x+3,o.y+3,o.w-6,o.h-6); }
+  function drawRoller(o){ ctx.save(); ctx.translate(o.x+o.r, o.y+o.r); ctx.rotate(o.a||0); ctx.fillStyle="#999"; ctx.beginPath(); for(let i=0;i<8;i++){ const a=i/8*Math.PI*2; ctx.moveTo(0,0); ctx.lineTo(Math.cos(a)*o.r, Math.sin(a)*o.r); } ctx.strokeStyle="#ccc"; ctx.stroke(); ctx.fillRect(-o.r, -1, o.r*2, 2); ctx.restore(); }
+  function drawLowbar(o){ ctx.fillStyle="#222"; ctx.fillRect(o.x, o.y, o.w, o.h); ctx.fillStyle="#555"; ctx.fillRect(o.x+2, o.y+2, o.w-4, o.h-4); }
+  function drawBird(e){ ctx.fillStyle="#ddd"; ctx.fillRect(e.x, e.y, e.w, e.h); ctx.fillStyle="#000"; ctx.fillRect(e.x+3, e.y+4, 3,2); }
+  function drawCoin(c){ ctx.save(); ctx.translate(c.x+5, c.y+5); ctx.scale(1, Math.sin(c.t)*0.2+0.8); ctx.fillStyle=varGold(); ctx.fillRect(-5,-5,10,10); ctx.restore(); }
+  function drawPower(pu){ ctx.save(); ctx.translate(pu.x+6, pu.y+6); ctx.rotate(pu.t+=0.1); if(pu.k==='magnet'){ ctx.fillStyle='#77f'; } else if(pu.k==='shield'){ ctx.fillStyle='#6f6'; } else { ctx.fillStyle='#ff7'; } ctx.fillRect(-6,-6,12,12); ctx.restore(); }
+  function drawProj(pr){ ctx.fillStyle = pr.friendly? '#7ef' : '#f77'; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); }
+  function drawBoss(b){ // boss body
+    ctx.fillStyle='#c45'; ctx.fillRect(b.x-16, b.y, 40, 80); ctx.fillStyle='#000'; ctx.fillRect(b.x-6, b.y+18, 6,6);
+    // hp bar
+    const w=160, h=8, x=BASE_W/2-w/2, y=10; ctx.fillStyle='#000a'; ctx.fillRect(x-1,y-1,w+2,h+2); ctx.fillStyle='#222'; ctx.fillRect(x,y,w,h); ctx.fillStyle='#f66'; ctx.fillRect(x,y,w*(b.hp/100),h);
+  }
+  function varGold(){ const t = (Math.sin(state.time*0.2)+1)/2; const a = lerp(0.7,1,t); return `rgba(255,215,102,${a})`; }
+  function triangle(x1,y1,x2,y2,x3,y3){ ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.closePath(); ctx.fill(); }
+  function shade(hex, amt){ const c = hex.replace('#',''); const r=parseInt(c.substr(0,2),16), g=parseInt(c.substr(2,2),16), b=parseInt(c.substr(4,2),16); const rr=clamp(r+amt,0,255), gg=clamp(g+amt,0,255), bb=clamp(b+amt,0,255); return '#'+[rr,gg,bb].map(v=>v.toString(16).padStart(2,'0')).join(''); }
+
+  function drawPlayer(){ const b = biome(); const pb = getPlayerBox(); const flick = player.hurtI>0 && Math.floor(state.time/4)%2===0; if(player.hurtI>0) player.hurtI--; if(!flick){ ctx.fillStyle = b.accents; ctx.fillRect(player.x, player.y, player.w, player.h); ctx.fillStyle = '#000'; ctx.fillRect(player.x+3, player.y+5, 4,3); } if(player.sliding){ ctx.fillStyle='#fff8'; const bb=getPlayerBox(); ctx.fillRect(bb.x, bb.y+bb.h-2, bb.w,2); }
+    if(state.shield){ ctx.strokeStyle = `rgba(126,231,135,${0.5+0.5*Math.sin(state.time*0.2)})`; ctx.lineWidth=2; ctx.strokeRect(player.x-2, player.y-2, player.w+4, player.h+4); }
+  }
+  function drawCentered(text, y, scale=2, color='#fff'){ ctx.save(); ctx.fillStyle=color; ctx.font = `${8*scale}px monospace`; ctx.textAlign='center'; ctx.fillText(text, BASE_W/2, y); ctx.restore(); }
+
+  // ===== Main Loop =====
+  function loop(){ state.time++; if(state.mode==='play'){ handleInput(); physics(); } draw(); requestAnimationFrame(loop); }
+
+  // ===== Boot =====
+  showMenu(); loop();
+})();
+</script>
+</body>
+</html>
+
+
+
